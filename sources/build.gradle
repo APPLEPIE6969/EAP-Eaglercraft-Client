@@ -1,0 +1,667 @@
+/*
+ * EaglerCraft 26.2 - Sources Subproject
+ *
+ * This is the main game sources subproject that compiles the Minecraft 26.2
+ * client code along with EaglerCraft adapter layers into JavaScript via TeaVM.
+ *
+ * Source sets:
+ *   main    - Core Minecraft 26.2 source code + EaglerCraft patches
+ *   teavm   - TeaVM-specific adapter layer (browser/GWT replacement)
+ *   lwjgl   - LWJGL compatibility layer for desktop runtime
+ *
+ * No MCP deobfuscation is needed since Minecraft 26.2 ships unobfuscated.
+ */
+
+plugins {
+    id 'java'
+    id 'org.teavm'
+}
+
+// Inherit project-wide properties from root
+def teaVMVersion = rootProject.ext.teaVMVersion
+def minecraftVersion = rootProject.ext.minecraftVersion
+def protocolVersion = rootProject.ext.protocolVersion
+
+dependencies {
+    // TeaVM dependencies using the new DSL shortcuts (0.15.0+)
+    implementation teavm.libs.jso
+    implementation teavm.libs.jsoApis
+
+    // TeaVM classlib and core (needed for compilation)
+    implementation "org.teavm:teavm-classlib:${teaVMVersion}"
+
+    // Minecraft 26.2 (unobfuscated - no MCP needed)
+    implementation files("libs/minecraft-${minecraftVersion}.jar")
+
+    // Minecraft dependency libraries (from Mojang's version manifest)
+    def mcLibs = [
+        'logging-1.7.12', 'brigadier-1.3.10', 'datafixerupper-10.0.21',
+        'authlib-9.0.75', 'blocklist-1.0.10', 'patchy-2.2.10',
+        'text2speech-1.19.12', 'jtracy-1.0.37',
+        'gson-2.14.0', 'guava-33.6.0-jre', 'failureaccess-1.0.3',
+        'commons-lang3-3.20.0', 'commons-compress-1.28.0',
+        'commons-io-2.20.0', 'commons-codec-1.22.0',
+        'fastutil-8.5.18',
+        'log4j-api-2.26.0', 'log4j-core-2.26.0',
+        // SLF4J excluded - we provide browser-compatible stubs instead
+        'jspecify-1.0.0',
+        'netty-buffer-4.2.15.Final', 'netty-common-4.2.15.Final',
+        'netty-transport-4.2.15.Final', 'netty-codec-base-4.2.15.Final',
+        'netty-codec-compression-4.2.15.Final', 'netty-handler-4.2.15.Final',
+        'jopt-simple-5.0.4',
+        // TeaVM classlib patches (StackWalker, CompletableFuture etc.)
+        'teavm-patches'
+    ]
+    mcLibs.each { lib ->
+        implementation files("libs/${lib}.jar")
+    }
+
+    // LWJGL for desktop runtime
+    implementation files("desktopRuntime/lwjgl.jar")
+    implementation files("desktopRuntime/lwjgl-glfw.jar")
+    implementation files("desktopRuntime/lwjgl-opengles.jar")
+    implementation files("desktopRuntime/lwjgl-openal.jar")
+
+    // Audio support
+    implementation files("desktopRuntime/jorbis.jar")
+    implementation files("desktopRuntime/codecjorbis.jar")
+    implementation files("desktopRuntime/soundsystem.jar")
+
+    // TeaVM source set also needs all the same dependencies
+    // since it includes both teavm/java and main/java code
+    teavmImplementation teavm.libs.jso
+    teavmImplementation teavm.libs.jsoApis
+    teavmImplementation "org.teavm:teavm-classlib:${teaVMVersion}"
+    teavmImplementation files("libs/minecraft-${minecraftVersion}.jar")
+    // DFU patches jar (un-finaled DataFixer + Schema) - BEFORE the DFU jar
+    // so javac reads our un-finaled versions instead of the original FINAL ones
+    // DFU un-finaled classes directory (added to classpath in generateJavaScript task)
+    mcLibs.each { lib ->
+        teavmImplementation files("libs/${lib}.jar")
+    }
+
+    // Test dependencies
+    testImplementation 'junit:junit:4.13.2'
+}
+
+// Note: TeaVM 0.15.0 plugin automatically creates a 'teavm' source set
+// at src/teavm/java. Our code is at teavm/java so we configure it here.
+// The plugin also creates a 'teavm' configuration for TeaVM-specific dependencies.
+sourceSets {
+    main {
+        java {
+            srcDirs = ['main/java']
+        }
+        resources {
+            srcDirs = ['resources']
+        }
+    }
+    // The teavm source set is auto-created by the TeaVM plugin.
+    // It contains BOTH the platform layer and the game adapter code.
+    // All EaglerCraft code that TeaVM compiles to JavaScript lives here.
+    teavm {
+        java {
+            srcDirs = ['teavm/java']
+        }
+        resources {
+            srcDirs = ['teavm/resources']
+        }
+        compileClasspath += sourceSets.main.compileClasspath
+        runtimeClasspath += sourceSets.main.runtimeClasspath
+    }
+    lwjgl {
+        java {
+            srcDirs = ['lwjgl/java']
+        }
+        compileClasspath += sourceSets.main.compileClasspath
+        runtimeClasspath += sourceSets.main.runtimeClasspath
+    }
+}
+
+// ============================================================
+// IMPORTANT: Wire teavmClasspath to include the teavm source
+// set output AND all teavmImplementation dependencies.
+// ============================================================
+// The TeaVM plugin's generateJavaScript task reads its classpath
+// ONLY from the 'teavmClasspath' configuration (see TeaVMPlugin
+// bytecode: applyToTask → getClasspath().from(getByName("teavmClasspath"))).
+// By default, teavmClasspath extends only from the 'teavm' config
+// and does NOT include teavmImplementation deps or source set output.
+// Without this wiring, TeaVM cannot find our overrides or the MC JAR.
+configurations {
+    teavmClasspath {
+        extendsFrom configurations.teavmImplementation
+    }
+    teavmPlugin
+}
+
+// ============================================================
+// TeaVM Plugin source set
+// ============================================================
+// This source set compiles our TeaVM plugin (ClassHolderTransformer)
+// into a separate JAR that's added to the TeaVM classpath. The plugin
+// adds missing methods to existing java.base classes that TeaVM's
+// classlib doesn't provide.
+sourceSets {
+    teavmplugin {
+        java {
+            srcDirs = ['teavm-plugin/java']
+        }
+        resources {
+            srcDirs = ['teavm-plugin/resources']
+        }
+        // The plugin needs access to TeaVM's API classes (TeaVMPlugin, ClassHolderTransformer, etc.)
+        // Use teavm source set's compileClasspath which already has teavm-classlib etc.
+        compileClasspath += sourceSets.teavm.compileClasspath
+    }
+}
+
+// Compile the TeaVM plugin
+tasks.register('compileTeavmPlugin', JavaCompile) {
+    group = 'build'
+    description = 'Compiles the TeaVM plugin that adds missing java.base methods'
+    source = sourceSets.teavmplugin.java
+    classpath = sourceSets.teavmplugin.compileClasspath
+    destinationDirectory = file('teavm-plugin/classes')
+    options.encoding = 'UTF-8'
+    options.fork = true
+    // Use --release 25 so javac 26 produces version 69 class files that
+    // TeaVM 0.15.0's repackaged ASM can parse. Without this, the plugin
+    // JAR would contain version 70 classes that TeaVM rejects.
+    options.release = 25
+}
+
+// Package the TeaVM plugin as a JAR
+tasks.register('teavmPluginJar', Jar) {
+    group = 'build'
+    description = 'Packages the TeaVM plugin as a JAR'
+    dependsOn 'compileTeavmPlugin'
+    archiveBaseName = 'eaglercraft-teavm-plugin'
+    archiveVersion = ''
+    archiveClassifier = ''
+    from('teavm-plugin/classes')
+    from('teavm-plugin/resources')
+    destinationDirectory = file('libs')
+}
+
+// Make the teavm-plugin JAR available as a dependency
+dependencies {
+    teavmPlugin files('libs/eaglercraft-teavm-plugin.jar')
+}
+
+afterEvaluate {
+    tasks.matching { it.name == 'generateJavaScript' }.configureEach {
+        dependsOn 'teavmPluginJar'
+        // Add the plugin JAR to the classpath so TeaVM discovers it via ServiceLoader
+        classpath.from(files('libs/eaglercraft-teavm-plugin.jar'))
+    }
+}
+
+// Also add the teavm source set output and main source set output
+// to teavmClasspath at task-execution time (deferred so it sees
+// the latest compiled output). The teavm source set output must
+// come BEFORE the MC JAR so our overrides take precedence.
+//
+// We ALSO prepend the java.base patch classes directory so that
+// our overrides for java.util.UUID, java.util.concurrent.*, etc.
+// are seen by TeaVM BEFORE teavm-classlib.jar. TeaVM uses the
+// first class definition it finds on the classpath, so putting
+// our patches first lets us add missing methods to java.base classes.
+// ============================================================
+// Task to patch teavm-core JAR (suppress PhiUpdater assertion)
+// ============================================================
+tasks.register('patchTeavmCore') {
+    group = 'build'
+    description = 'Patches teavm-core JAR to suppress PhiUpdater assertion'
+    doLast {
+        def gradleCache = new File(System.getProperty('user.home'), '.gradle/caches')
+        def teavmJars = []
+        gradleCache.eachFileRecurse { f ->
+            if (f.name.startsWith('teavm-core-') && f.name.endsWith('.jar') && !f.name.contains('sources')) {
+                teavmJars << f
+            }
+        }
+        if (teavmJars.isEmpty()) {
+            logger.warn("teavm-core JAR not found — skipping patch")
+            return
+        }
+        def patchScript = rootProject.file('scripts/patch_teavm_jar.py')
+        if (!patchScript.exists()) {
+            logger.warn("Patch script not found: ${patchScript}")
+            return
+        }
+        teavmJars.each { jar ->
+            logger.lifecycle("Patching teavm-core JAR: ${jar}")
+            def pb = new ProcessBuilder('python3', patchScript.absolutePath,
+                    jar.absolutePath, jar.absolutePath + '.tmp')
+            pb.redirectErrorStream(true)
+            def proc = pb.start()
+            def out = proc.inputStream.text
+            def exitCode = proc.waitFor()
+            if (exitCode == 0) {
+                jar.delete()
+                new File(jar.absolutePath + '.tmp').renameTo(jar)
+                logger.lifecycle("Successfully patched: ${jar}")
+            } else {
+                logger.warn("Failed to patch ${jar}: ${out}")
+            }
+        }
+    }
+}
+
+// ============================================================
+// Task to patch teavm-classlib JAR (add missing methods)
+// ============================================================
+tasks.register('patchTeavmClasslib') {
+    group = 'build'
+    description = 'Patches teavm-classlib JAR to add missing methods via bytecode manipulation'
+    doLast {
+        def gradleCache = new File(System.getProperty('user.home'), '.gradle/caches')
+        def classlibJars = []
+        gradleCache.eachFileRecurse { f ->
+            if (f.name.startsWith('teavm-classlib-') && f.name.endsWith('.jar') && !f.name.contains('sources')) {
+                classlibJars << f
+            }
+        }
+        if (classlibJars.isEmpty()) {
+            logger.warn("teavm-classlib JAR not found — skipping patch")
+            return
+        }
+        def patchScript = rootProject.file('scripts/patch_classlib_jar.py')
+        if (!patchScript.exists()) {
+            logger.warn("Classlib patch script not found: ${patchScript}")
+            return
+        }
+        classlibJars.each { jar ->
+            logger.lifecycle("Patching teavm-classlib JAR: ${jar}")
+            def pb = new ProcessBuilder('python3', patchScript.absolutePath,
+                    jar.absolutePath, jar.absolutePath + '.tmp')
+            pb.redirectErrorStream(true)
+            def proc = pb.start()
+            def out = proc.inputStream.text
+            def exitCode = proc.waitFor()
+            if (exitCode == 0) {
+                jar.delete()
+                new File(jar.absolutePath + '.tmp').renameTo(jar)
+                logger.lifecycle("Successfully patched classlib: ${jar}")
+                logger.lifecycle("Patch output: ${out}")
+            } else {
+                logger.warn("Failed to patch classlib ${jar}: ${out}")
+            }
+        }
+    }
+}
+
+afterEvaluate {
+    tasks.matching { it.name == 'generateJavaScript' }.configureEach {
+        dependsOn 'compileTeavmJava'
+        dependsOn 'patchTeavmCore'
+        dependsOn 'patchTeavmClasslib'
+        inputs.files sourceSets.teavm.output
+
+        // Prepend our classes so they're scanned first by TeaVM.
+        def patchClassesDir = file('teavm/patch/classes')
+        def dfuClassesDir = file("teavm/patch/dfu-classes")
+        def jdkPatchClassesDir = file('teavm/patch/jdk-classes')
+        def dfuPatchesDir = file('teavm/patch/dfu-classes')
+        def ourClasses = [patchClassesDir, jdkPatchClassesDir, dfuClassesDir] + sourceSets.teavm.output.files + sourceSets.main.output.files
+        def existingCp = classpath.files
+        classpath.setFrom(ourClasses)
+        classpath.from(existingCp)
+    }
+}
+
+// Task to compile java.base patches into sources/teavm/patch/classes/
+// before TeaVM runs. These patches override/extend classes from
+// teavm-classlib.jar by being placed FIRST on the TeaVM classpath.
+tasks.register('compileTeavmPatches') {
+    group = 'build'
+    description = 'Compiles java.base patches for TeaVM classlib overrides'
+    def patchSrcDir = file('teavm/patch/java')
+    def patchClassesDir = file('teavm/patch/classes')
+        def dfuClassesDir = file("teavm/patch/dfu-classes")
+    inputs.dir patchSrcDir
+    outputs.dir patchClassesDir
+    doLast {
+        patchClassesDir.mkdirs()
+        def jdkHome = System.getenv('JAVA_HOME') ?: '/home/z/.jdks/jdk-25.0.3+9'
+        def javac = "${jdkHome}/bin/javac"
+        def srcFiles = []
+        fileTree(patchSrcDir).matching { include '**/*.java' }.each { srcFiles << it.absolutePath }
+        if (!srcFiles.isEmpty()) {
+            // Use Java exec API directly since project.exec() isn't available in doLast
+            def pb = new ProcessBuilder()
+            pb.command(javac, '--release', '25',
+                    "--patch-module", "java.base=${patchSrcDir.absolutePath}",
+                    '-d', patchClassesDir.absolutePath)
+            pb.command().addAll(srcFiles)
+            pb.redirectErrorStream(true)
+            def proc = pb.start()
+            def out = proc.inputStream.text
+            def exitCode = proc.waitFor()
+            if (exitCode != 0) {
+                println out
+                throw new GradleException("Patch compilation failed with exit code ${exitCode}")
+            }
+        }
+        // Copy META-INF/services into the classes directory so TeaVM's
+        // ServiceLoader can discover our FileSystemProvider implementations
+        // (e.g., JarFileSystemProvider for the "jar" URI scheme).
+        def metaInfDir = file('teavm/patch/META-INF')
+        if (metaInfDir.exists()) {
+            def targetDir = file("${patchClassesDir.absolutePath}/META-INF")
+            targetDir.mkdirs()
+            copy {
+                from metaInfDir
+                into targetDir
+            }
+            println "Copied META-INF/services to ${targetDir}"
+        }
+    }
+}
+
+// ============================================================
+// Task to compile jdk.jfr patches separately.
+// jdk.jfr is a system module, so we need --patch-module jdk.jfr=...
+// to compile stubs for FlightRecorder, Event, Recording.
+// The compiled classes go into teavm/patch/jdk-classes/ and are
+// added to the TeaVM classpath.
+// ============================================================
+tasks.register('compileJdkJfrPatches') {
+    group = 'build'
+    description = 'Compiles jdk.jfr patches (FlightRecorder, Event, Recording)'
+    def jfrSrcDir = file('teavm/patch/jdk/jfr')
+    def jfrClassesDir = file('teavm/patch/jdk-classes')
+    inputs.dir jfrSrcDir
+    outputs.dir jfrClassesDir
+    doLast {
+        jfrClassesDir.mkdirs()
+        def jdkHome = System.getenv('JAVA_HOME') ?: '/home/z/.jdks/jdk-25.0.3+9'
+        def javac = "${jdkHome}/bin/javac"
+        def srcFiles = []
+        fileTree(jfrSrcDir).matching { include '**/*.java' }.each { srcFiles << it.absolutePath }
+        if (!srcFiles.isEmpty()) {
+            def pb = new ProcessBuilder()
+            pb.command(javac, '--release', '25',
+                    "--patch-module", "jdk.jfr=${jfrSrcDir.absolutePath}",
+                    '-d', jfrClassesDir.absolutePath)
+            pb.command().addAll(srcFiles)
+            pb.redirectErrorStream(true)
+            def proc = pb.start()
+            def out = proc.inputStream.text
+            def exitCode = proc.waitFor()
+            if (exitCode != 0) {
+                println out
+                // Don't fail the build — jdk.jfr is optional
+                println "WARNING: jdk.jfr patch compilation failed (non-fatal)"
+            } else {
+                println "jdk.jfr patches compiled successfully"
+            }
+        }
+    }
+}
+
+// Make generateJavaScript depend on patch compilation
+tasks.matching { it.name == 'generateJavaScript' }.configureEach {
+    dependsOn 'compileTeavmPatches'
+    dependsOn 'compileJdkJfrPatches'
+}
+
+java {
+    sourceCompatibility = JavaVersion.VERSION_25
+    targetCompatibility = JavaVersion.VERSION_25
+}
+
+// Set JDK path for Java compilation
+// Use JAVA_HOME from the environment if available, otherwise fall back to local JDK
+def jdkHome = System.getenv('JAVA_HOME') ?: '/home/z/.jdks/jdk-25.0.3+9'
+if (file(jdkHome).exists()) {
+    tasks.withType(JavaCompile).configureEach {
+        options.fork = true
+        options.forkOptions.javaHome = file(jdkHome)
+        // Use --release 25 (instead of --source/--target) so javac 26 produces
+        // version 69 class files that TeaVM 0.15.0's repackaged ASM can parse.
+        // Without --release, javac 26 emits version 70 classes even with --source 25.
+        options.release = 25
+    }
+}
+
+// ============================================================
+// TeaVM Configuration (0.15.0 DSL)
+// ============================================================
+// See: https://teavm.org/docs/tooling/gradle.html
+//
+// DSL structure:
+//   teavm { }             - top-level container
+//     all { }             - common config (mainClass, optimization, properties)
+//     js { }              - JS-specific (obfuscated, sourceMap, targetFileName, maxTopLevelNames)
+//     wasmGC { }          - Wasm GC-specific
+//     c { }               - C target-specific
+//
+// IMPORTANT: mainClass, optimization, properties go in teavm.all { },
+// NOT directly in teavm { } — the top-level TeaVMExtension does not
+// have these properties (causes "unknown property" error).
+
+teavm {
+    all {
+        // Common configuration (applies to all targets)
+        mainClass = 'net.lax1dude.eaglercraft.v2_6.internal.teavm.MainClass'
+
+        // TeaVM optimization level investigation:
+        // Previous CI runs showed NONE and BALANCED produce IDENTICAL output
+        // (60,520,591 vs 60,520,603 bytes — 12 byte diff = just build hash).
+        // TeaVMTask.class has `convention(BALANCED)` as default, suggesting
+        // our explicit `optimization = NONE` in `all { }` was NOT being
+        // propagated to the actual TeaVM task (inheritance via setupDefaults
+        // likely happens before our override).
+        //
+        // Now trying AGGRESSIVE to:
+        //   1. Verify the optimization setting is actually being applied
+        //      (if AGGRESSIVE produces different output than BALANCED, it works)
+        //   2. Get maximum DCE to shrink the 60MB classes.js
+        //
+        // TeaVM 0.15 OptimizationLevel enum values: NONE, BALANCED, AGGRESSIVE
+        // TeaVM 0.15 TeaVMOptimizationLevel (internal): SIMPLE, ADVANCED, FULL
+        // The gradle plugin maps OptimizationLevel → TeaVMOptimizationLevel.
+        optimization = org.teavm.gradle.api.OptimizationLevel.AGGRESSIVE
+
+        // Additional TeaVM properties (bumped for AGGRESSIVE optimization)
+        properties = [
+            'teavm.minHeapSize' : '2048MB',
+            'teavm.maxHeapSize' : '12288MB'
+        ]
+    }
+
+    js {
+        // OBFUSCATED build — TeaVM shortens all function/variable names
+        // (cms_Codec_$listOf → a, b, c etc.) producing a much smaller file.
+        //
+        // Previous: obfuscated=false produced 60MB classes.js which froze
+        // browsers during parsing ("Page doesn't respond"). JS parsing is
+        // synchronous and can't be made non-blocking on the main thread.
+        //
+        // Now: obfuscated=true should produce ~15MB classes.js that parses
+        // in 2-5 seconds. The default-method patcher's runtime prototype
+        // scanner (Method 1) works regardless of obfuscation because it
+        // inspects interface objects at runtime, not name patterns.
+        //
+        // Text patches (File.toPath, FileChannel.open, clinit wrapping, etc.)
+        // rely on unobfuscated function names and will be silently skipped.
+        // These patches fix null-safety and platform issues. If the game
+        // crashes without them, we'll need to move the fixes to Java source
+        // patches (sources/teavm/patch/) which survive obfuscation.
+        obfuscated = true
+
+        sourceMap = true
+
+        targetFileName = 'classes.js'
+
+        maxTopLevelNames = 200000
+    }
+}
+
+// ============================================================
+// Override TeaVM optimization directly on the task
+// ============================================================
+// The `optimization = ...` setting inside `teavm { all { } }` is NOT
+// propagated to the actual generateJavaScript task. Confirmed by CI
+// runs #293 (NONE), #294 (BALANCED), #295 (AGGRESSIVE) — all produced
+// identical 60.5MB output. TeaVMTask.class has `convention(BALANCED)`
+// as default, and the `all { }` → task inheritance via setupDefaults
+// happens before our override, so the convention wins.
+//
+// Setting it directly on the task forces the value and bypasses the
+// convention. This is the only way to actually change the optimization
+// level in TeaVM 0.15.0's gradle plugin.
+tasks.withType(org.teavm.gradle.tasks.GenerateJavaScriptTask).configureEach {
+    // BALANCED optimization — the only level that works with TeaVM 0.15 on
+    // the MC 26.2 codebase.
+    //
+    // AGGRESSIVE was attempted (CI #296, #298, #299, #300) but fails with
+    // a chain of NPEs in TeaVM's optimizer:
+    //   1. BranchingInstruction.getOperand() returns null (FIXED in CI #300
+    //      via null-safe VariableEscapeAnalyzer, ConstantConditionElimination,
+    //      EscapeAnalysis patches)
+    //   2. InstructionCopyReader.copyVar() receives null VariableReader
+    //      (NOT YET FIXED — would need patching InstructionCopyReader.java)
+    //   3. Likely many more NPE sites in InterferenceGraphBuilder,
+    //      RegisterAllocator, ProgramUtils, etc. (30+ potential sites found)
+    //
+    // BALANCED optimization performs DCE which removes methods that are
+    // actually needed (called via virtual dispatch). This caused:
+    //   Ue.qd(...).p_ is not a function
+    // The p_ method was DCE'd entirely — not on any prototype.
+    //
+    // NONE optimization keeps ALL methods (no DCE). Combined with
+    // obfuscated=true (short names), the file should be ~30-40MB
+    // (smaller than 60MB unobfuscated, larger than 16MB BALANCED).
+    // All methods preserved → no missing method crashes.
+    optimization = org.teavm.gradle.api.OptimizationLevel.NONE
+    // 12GB for the TeaVM daemon JVM (forked separately from Gradle)
+    processMemory = 12288
+}
+
+// ============================================================
+// Java Compilation Options
+// ============================================================
+tasks.withType(JavaCompile) {
+    options.encoding = 'UTF-8'
+    // --enable-preview removed - Java 21 doesn't support Java 25 preview features
+    // MC 26.2 JAR is pre-compiled; TeaVM reads bytecode directly
+    options.fork = true
+    // --release 25 (not --source/--target) so javac 26 emits version 69 class
+    // files that TeaVM 0.15.0's repackaged ASM can parse.
+    options.release = 25
+}
+
+// ============================================================
+// Custom Tasks
+// ============================================================
+
+// Compile the TeaVM source set alongside main
+tasks.named('compileTeavmJava') {
+    dependsOn tasks.named('compileJava')
+}
+
+// Compile the LWJGL source set alongside main
+tasks.named('compileLwjglJava') {
+    dependsOn tasks.named('compileJava')
+}
+
+// Copy compiled JavaScript and resources to the web output directory
+tasks.register('generateWeb', Copy) {
+    group = 'eaglercraft'
+    description = 'Assembles the web client output directory'
+
+    dependsOn tasks.named('generateJavaScript')
+
+    from(layout.buildDirectory.dir('generated/teavm/js')) {
+        include 'classes.js'
+        include 'classes.js.map'
+    }
+    from('resources') {
+        include 'index.html'
+        include 'worker.js'
+        include 'fix-webm-duration.js'
+        include 'assets/**'
+        include 'lang/**'
+    }
+    into(layout.buildDirectory.dir('web'))
+}
+
+// Package the web client into a distribution zip
+tasks.register('distWeb', Zip) {
+    group = 'distribution'
+    description = 'Creates a distribution ZIP of the web client'
+
+    dependsOn tasks.named('generateWeb')
+
+    archiveBaseName = 'eaglercraft'
+    archiveVersion = project.version
+    archiveClassifier = 'web'
+
+    from(layout.buildDirectory.dir('web')) {
+        into 'eaglercraft-26.2-web'
+    }
+}
+
+// Package the desktop runtime into a distribution zip
+tasks.register('distDesktop', Zip) {
+    group = 'distribution'
+    description = 'Creates a distribution ZIP of the desktop runtime'
+
+    dependsOn tasks.named('jar')
+
+    archiveBaseName = 'eaglercraft'
+    archiveVersion = project.version
+    archiveClassifier = 'desktop'
+
+    from(tasks.named('jar').map { it.archiveFile }) {
+        into 'eaglercraft-26.2-desktop'
+    }
+    from('desktopRuntime') {
+        include '*.jar'
+        into 'eaglercraft-26.2-desktop/libs'
+    }
+}
+
+// Full distribution build
+tasks.register('dist') {
+    group = 'distribution'
+    description = 'Creates all distribution artifacts'
+
+    dependsOn tasks.named('distWeb')
+    dependsOn tasks.named('distDesktop')
+}
+
+// ============================================================
+// JAR Configuration
+// ============================================================
+jar {
+    archiveBaseName = 'eaglercraft-sources'
+    archiveVersion = project.version
+
+    // Include all source sets in the jar for desktop runtime
+    from sourceSets.main.output
+    from sourceSets.lwjgl.output
+
+    manifest {
+        attributes(
+            'Main-Class': 'net.lax1dude.eaglercraft.v2_6.internal.lwjgl.MainClass',
+            'Implementation-Title': 'EaglerCraft',
+            'Implementation-Version': project.version,
+            'Minecraft-Version': minecraftVersion,
+            'Protocol-Version': protocolVersion.toString(),
+            'Built-By': 'EaglerCraft Build System',
+            'Built-JDK': System.getProperty('java.version'),
+            'Build-Timestamp': new Date().format("yyyy-MM-dd'T'HH:mm:ssZ")
+        )
+    }
+}
+
+// ============================================================
+// Build Lifecycle
+// ============================================================
+tasks.named('build') {
+    dependsOn tasks.named('generateWeb')
+}

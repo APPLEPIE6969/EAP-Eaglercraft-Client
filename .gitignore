@@ -1,0 +1,95 @@
+# Build outputs
+build/
+output/
+.next/
+node_modules/
+
+# IDE
+.idea/
+*.iml
+.vscode/
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+teavm-build-result.log
+teavm-build.log
+teavm-gen.log
+teavm-output.log
+dev.log
+
+# Workspace junk
+.env
+agent-ctx/
+db/
+download/
+examples/
+mini-services/
+prisma/
+search*.json
+skills/
+src/
+tool-results/
+upload/
+worklog.md
+.zscripts/
+Caddyfile
+components.json
+eslint.config.mjs
+next-env.d.ts
+next.config.ts
+package.json
+bun.lock
+postcss.config.mjs
+tailwind.config.ts
+tsconfig.json
+vercel-cli-docs.json
+vercel-codenote.json
+vercel-docs.json
+vercel-ids.json
+teavm_013_notes.json
+teavm_gradle_docs.json
+teavm_plugin.json
+teavm_releases.json
+teavm_search.json
+
+# JAR files at root (not part of eaglercraft)
+/*.jar
+
+# Eaglercraft build artifacts
+sources/build/
+sources/libs/*.jar
+sources/teavm/patch/classes/
+
+# Gradle
+.gradle/
+
+# Minecraft JAR (too large, downloaded by CI)
+minecraft-26.1.2.jar
+sources/libs/minecraft-26.1.2.jar
+
+# EPK assets (binary, built by CI)
+output/assets.epk
+
+# Generated JS source map (built by CI)
+public/classes.js.map
+# Local MC JAR inspection (not for distribution)
+mc-jar/
+teavm-plugin/classes/
+sources/libs/eaglercraft-teavm-plugin.jar
+
+# Minecraft JARs (Mojang copyright — do NOT commit)
+minecraft-*.jar
+sources/libs/minecraft-*.jar
+# Exception: keep vineflower (Apache 2.0)
+!buildtools/lib/vineflower-1.10.1.jar
+
+# Build outputs
+output/
+sources/build/
+workspace/
+*.epk
+!sources/setup/workspace_template/**/*.epk

@@ -1,0 +1,486 @@
+name: Build & Deploy
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+env:
+  JAVA_VERSION: '26'
+  NODE_VERSION: '22'
+  GRADLE_OPTS: '-Xmx12g -XX:+UseG1GC -XX:+HeapDumpOnOutOfMemoryError'
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: 'true'
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pages: write
+      id-token: write
+
+    steps:
+      # ── Checkout ──────────────────────────────────────────────
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # ── Setup Java 26 ────────────────────────────────────────
+      # JDK 26 (March 2026) avoids the Lower.visitClassDef NPE that
+      # breaks DFU patches in BOTH 25.0.2 and 25.0.3. We compile with
+      # --source 25 (no --enable-preview) so javac 26 doesn't reject
+      # the source/preview mismatch.
+      - name: Setup Java 26
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '26'
+          cache: 'gradle'
+
+      # ── Setup Node.js 22 ─────────────────────────────────────
+      - name: Setup Node.js 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      # ── Cache Minecraft JAR ──────────────────────────────────
+      - name: Cache Minecraft JAR
+        id: cache-mc-jar
+        uses: actions/cache@v4
+        with:
+          path: minecraft-26.2.jar
+          key: minecraft-26.2-jar-v1
+
+      # ── Download Minecraft JAR if needed ─────────────────────
+      - name: Download Minecraft JAR
+        if: steps.cache-mc-jar.outputs.cache-hit != 'true'
+        run: |
+          echo "Downloading Minecraft 26.2 client JAR from Mojang..."
+          VERSION_URL=$(curl -sL "https://piston-meta.mojang.com/mc/game/version_manifest_v2.json" | python3 -c "
+          import json,sys
+          data=json.load(sys.stdin)
+          for v in data.get('versions',[]):
+            if v.get('id')=='26.2':
+              print(v.get('url',''))
+              break
+          ")
+          if [ -z "$VERSION_URL" ]; then
+            echo "ERROR: Could not find MC 26.2 in version manifest"
+            exit 1
+          fi
+          echo "Version JSON: $VERSION_URL"
+          CLIENT_URL=$(curl -sL "$VERSION_URL" | python3 -c "
+          import json,sys
+          data=json.load(sys.stdin)
+          print(data.get('downloads',{}).get('client',{}).get('url',''))
+          ")
+          if [ -z "$CLIENT_URL" ]; then
+            echo "ERROR: Could not find client JAR URL"
+            exit 1
+          fi
+          echo "Client JAR URL: $CLIENT_URL"
+          curl -L -o minecraft-26.2.jar "$CLIENT_URL"
+          echo "Downloaded $(stat -c%s minecraft-26.2.jar) bytes"
+
+      - name: Check for Minecraft JAR
+        id: check-jar
+        run: |
+          if [ -f minecraft-26.2.jar ] && [ -s minecraft-26.2.jar ]; then
+            echo "found=true" >> $GITHUB_OUTPUT
+            echo "Minecraft JAR found ($(stat -c%s minecraft-26.2.jar) bytes)"
+          else
+            echo "found=false" >> $GITHUB_OUTPUT
+            echo "No Minecraft JAR found - will build platform layer only"
+          fi
+
+      # ── Setup Gradle ─────────────────────────────────────────
+      - name: Setup Gradle
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-home-cache-cleanup: true
+
+      # ── Download TeaVM deps and patch JARs BEFORE Gradle loads classes ──
+      - name: Download and patch TeaVM dependencies
+        run: |
+          echo "Downloading TeaVM dependencies..."
+          # Use $GITHUB_WORKSPACE instead of hardcoded path (was: /home/runner/work/eaglercraft-26.2/eaglercraft-26.2)
+          cd "$GITHUB_WORKSPACE"
+          ./gradlew :sources:dependencies --configuration teavmClasspath --no-daemon 2>/dev/null || true
+          
+          echo "Patching teavm-core JAR (suppress PhiUpdater assertion)..."
+          TEAVM_CORE=$(find ~/.gradle/caches -name "teavm-core-0.15.0.jar" -not -name "*sources*" -type f 2>/dev/null | head -1)
+          if [ -n "$TEAVM_CORE" ]; then
+            python3 scripts/patch_teavm_jar.py "$TEAVM_CORE" "$TEAVM_CORE.tmp"
+            mv "$TEAVM_CORE.tmp" "$TEAVM_CORE"
+            echo "Patched teavm-core: $TEAVM_CORE"
+          fi
+          
+          echo "Patching teavm-classlib JAR (add missing methods)..."
+          TEAVM_CL=$(find ~/.gradle/caches -name "teavm-classlib-0.15.0.jar" -not -name "*sources*" -type f 2>/dev/null | head -1)
+          if [ -n "$TEAVM_CL" ]; then
+            python3 scripts/patch_classlib_jar.py "$TEAVM_CL" "$TEAVM_CL.tmp"
+            mv "$TEAVM_CL.tmp" "$TEAVM_CL"
+            echo "Patched teavm-classlib: $TEAVM_CL"
+          else
+            echo "WARNING: teavm-classlib JAR not found!"
+          fi
+          
+          echo "Patching DFU jar (replace null returns with non-null)..."
+          DFU_JAR=$(find ~/.gradle/caches -name "datafixerupper-*.jar" -not -name "*sources*" -type f 2>/dev/null | head -1)
+          if [ -n "$DFU_JAR" ]; then
+            python3 scripts/patch_dfu_jar.py "$DFU_JAR" "$DFU_JAR.tmp"
+            mv "$DFU_JAR.tmp" "$DFU_JAR"
+            echo "Patched DFU jar: $DFU_JAR"
+          else
+            echo "WARNING: DFU jar not found!"
+          fi
+          
+          echo "Patching teavm-relocated-libs-asm JAR (accept class file version 70 for JDK 26)..."
+          # Find ALL teavm-relocated-libs-asm-0.15.0.jar files in the Gradle cache.
+          # There may be multiple (different hashes). Patch EACH one, because we don't
+          # know which one TeaVM will actually load at runtime.
+          TEAVM_ASMS=$(find ~/.gradle/caches -name "teavm-relocated-libs-asm-0.15.0.jar" -not -name "*sources*" -type f 2>/dev/null)
+          if [ -z "$TEAVM_ASMS" ]; then
+            echo "WARNING: teavm-relocated-libs-asm JAR not found in Gradle cache!"
+            echo "Downloading directly from Maven Central as fallback..."
+            mkdir -p /tmp/teavm-asm-download
+            curl -sL -o /tmp/teavm-asm-download/teavm-relocated-libs-asm-0.15.0.jar \
+              "https://repo1.maven.org/maven2/org/teavm/teavm-relocated-libs-asm/0.15.0/teavm-relocated-libs-asm-0.15.0.jar"
+            TEAVM_ASMS="/tmp/teavm-asm-download/teavm-relocated-libs-asm-0.15.0.jar"
+          fi
+          for TEAVM_ASM in $TEAVM_ASMS; do
+            echo "Patching: $TEAVM_ASM"
+            SHA_BEFORE=$(sha1sum "$TEAVM_ASM" | cut -d' ' -f1)
+            echo "  SHA1 before: $SHA_BEFORE"
+            if python3 scripts/patch_teavm_asm.py "$TEAVM_ASM" "$TEAVM_ASM.tmp"; then
+              mv "$TEAVM_ASM.tmp" "$TEAVM_ASM"
+              SHA_AFTER=$(sha1sum "$TEAVM_ASM" | cut -d' ' -f1)
+              echo "  SHA1 after:  $SHA_AFTER"
+              echo "  Patched: $TEAVM_ASM"
+            else
+              echo "  WARNING: patch failed for $TEAVM_ASM (continuing — may be a stale cache entry)"
+              rm -f "$TEAVM_ASM.tmp"
+            fi
+          done
+
+      # ── Make scripts executable ──────────────────────────────
+      - name: Make scripts executable
+        run: |
+          chmod +x gradlew
+          chmod +x run_chmod.sh 2>/dev/null && ./run_chmod.sh 2>/dev/null || true
+          chmod +x build_init.sh build_compile.sh build_dist.sh build_clean.sh build_workspace.sh CompileLatestClient.sh 2>/dev/null || true
+
+      # ── Build: Init workspace ────────────────────────────────
+      - name: Initialize workspace
+        run: |
+          mkdir -p sources/libs
+          if [ -f minecraft-26.2.jar ]; then
+            cp minecraft-26.2.jar sources/libs/minecraft-26.2.jar
+            echo "MC JAR copied to sources/libs/"
+          fi
+          echo "Downloading MC dependency libraries..."
+          python3 -c "
+          import urllib.request, json, os
+          with urllib.request.urlopen('https://piston-meta.mojang.com/v1/packages/73300f962b1d9c183957806be67850b740d3c949/26.2.json') as r:
+            data = json.loads(r.read())
+          libs_to_download = [
+            'com.mojang:logging', 'com.mojang:brigadier', 'com.mojang:datafixerupper',
+            'com.mojang:authlib', 'com.mojang:blocklist', 'com.mojang:patchy',
+            'com.mojang:text2speech', 'com.mojang:jtracy',
+            'com.google.code.gson:gson', 'com.google.guava:guava', 'com.google.guava:failureaccess',
+            'org.apache.commons:commons-lang3', 'org.apache.commons:commons-compress',
+            'commons-io:commons-io', 'commons-codec:commons-codec',
+            'it.unimi.dsi:fastutil',
+            'org.apache.logging.log4j:log4j-api', 'org.apache.logging.log4j:log4j-core',
+            'org.jspecify:jspecify',
+            'io.netty:netty-buffer', 'io.netty:netty-common', 'io.netty:netty-transport',
+            'io.netty:netty-codec-base', 'io.netty:netty-codec-compression', 'io.netty:netty-handler',
+            'net.sf.jopt-simple:jopt-simple'
+          ]
+          for lib in data.get('libraries', []):
+            name = lib.get('name', '')
+            if 'natives-' in name:
+              continue
+            should_download = any(name.startswith(prefix) for prefix in libs_to_download)
+            if not should_download:
+              continue
+            artifact = lib.get('downloads', {}).get('artifact', {})
+            url = artifact.get('url', '')
+            if url:
+              filename = url.split('/')[-1]
+              if os.path.exists(f'sources/libs/{filename}'):
+                print(f'Skip {filename} (already exists)')
+                continue
+              print(f'Downloading {filename}...')
+              for attempt in range(5):
+                try:
+                  urllib.request.urlretrieve(url, f'sources/libs/{filename}')
+                  break
+                except Exception as e:
+                  print(f'  Attempt {attempt+1} failed: {e}')
+                  if attempt < 4:
+                    import time; time.sleep(5)
+                  else:
+                    raise
+          print('Done downloading libraries')
+          "
+          echo "Libraries in sources/libs/:"
+          ls -la sources/libs/
+
+
+      # ── Patch JAR: replace record classes with class stubs ────
+      - name: Patch JAR records (TeaVM record support workaround)
+        run: |
+          echo "Compiling stub classes to replace records in vanilla JAR..."
+          mkdir -p /tmp/stub-classes
+          # Compile our stubs that replace vanilla record classes
+          find sources/teavm/java/com/mojang/blaze3d -name "*.java" -type f | while read f; do
+            class_path=$(echo "$f" | sed 's|sources/teavm/java/||' | sed 's|/[^/]*$||')
+            mkdir -p "/tmp/stub-classes/$class_path"
+          done
+          # Compile all stubs
+          # Only compile the specific classes that need to replace vanilla records
+          # (compiling ALL stubs fails because they use TeaVM-specific APIs like Float32Array)
+          STUB_FILES=""
+          for cls in DeviceInfo DeviceLimits DeviceFeatures HintsAndWorkarounds GpuSurface GpuDebugOptions BlendFunction BindGroupLayout PrimitiveTopology GpuFormat IndexType VkExtensionProperties VkLayerProperties VkQueueFamilyProperties GlBackend VulkanBackend; do
+            f=$(find sources/teavm/java -name "${cls}.java" -type f 2>/dev/null | head -1)
+            if [ -n "$f" ]; then
+              STUB_FILES="$STUB_FILES $f"
+            fi
+          done
+          echo "Compiling stub files: $STUB_FILES"
+          $JAVA_HOME/bin/javac --release 25 -cp sources/libs/minecraft-26.2.jar -d /tmp/stub-classes $STUB_FILES 2>&1 || true
+          # Replace record .class files in the JAR
+          python3 -c "
+          import zipfile, os, shutil
+          jar_path = 'sources/libs/minecraft-26.2.jar'
+          classes_to_replace = []
+          for root, dirs, files in os.walk('/tmp/stub-classes'):
+            for f in files:
+              if f.endswith('.class'):
+                rel = os.path.relpath(os.path.join(root, f), '/tmp/stub-classes')
+                classes_to_replace.append((os.path.join(root, f), rel.replace(os.sep, '/')))
+          print(f'Replacing {len(classes_to_replace)} classes in JAR')
+          # Create patched JAR - REMOVE record classes so TeaVM uses our source stubs
+          with zipfile.ZipFile(jar_path, 'r') as zin:
+            with zipfile.ZipFile(jar_path + '.patched', 'w', zipfile.ZIP_DEFLATED) as zout:
+              for item in zin.infolist():
+                # Check if this class should be removed (replaced by our source stub)
+                should_remove = False
+                for cls_path, cls_name in classes_to_replace:
+                  if item.filename == cls_name:
+                    should_remove = True
+                    break
+                if should_remove:
+                  print(f'  Removed: {item.filename}')
+                else:
+                  zout.writestr(item, zin.read(item.filename))
+          os.replace(jar_path + '.patched', jar_path)
+          print(f'Patched JAR saved to {jar_path}')
+          "
+
+      # ── Create DFU patches (un-final DataFixer + Schema) ─────
+      - name: Create DFU patches (un-finaled class files)
+        run: |
+          DFU_JAR=$(find sources/libs ~/.gradle/caches -name "datafixerupper-*.jar" -not -name "*sources*" -type f 2>/dev/null | head -1)
+          if [ -n "$DFU_JAR" ]; then
+            echo "Creating DFU patches from: $DFU_JAR"
+            python3 scripts/patch_dfu_final.py "$DFU_JAR" sources/teavm/patch/dfu-classes
+            echo "DFU patches created (un-finaled DataFixer + Schema)"
+          else
+            echo "WARNING: DFU jar not found!"
+          fi
+
+      # ── Build: Compile with Gradle ───────────────────────────
+      - name: Build with Gradle
+        run: |
+          echo "Building TeaVM classlib patches..."
+          mkdir -p sources/teavm/patch/classes
+          cd sources/teavm/patch
+          $JAVA_HOME/bin/javac --release 25 \
+            --patch-module java.base=$(pwd) \
+            -d classes \
+            $(find java -name "*.java" -type f)
+          $JAVA_HOME/bin/jar cf ../../libs/teavm-patches.jar -C classes .
+          echo "teavm-patches.jar built ($(stat -c%s ../../libs/teavm-patches.jar) bytes)"
+          echo "=== Patch JAR contents (first 50 entries) ==="
+          $JAVA_HOME/bin/jar tf ../../libs/teavm-patches.jar | head -50
+          echo "=== Verify key patched classes have our methods ==="
+          echo "Runtime.maxMemory() present:"
+          $JAVA_HOME/bin/javap -p -classpath ../../libs/teavm-patches.jar java.lang.Runtime 2>&1 | grep -i "maxMemory\|addShutdownHook" || echo "  NOT FOUND"
+          echo "UUID.getMostSignificantBits() present:"
+          $JAVA_HOME/bin/javap -p -classpath ../../libs/teavm-patches.jar java.util.UUID 2>&1 | grep -i "getMostSignificantBits\|nameUUIDFromBytes" || echo "  NOT FOUND"
+          echo "HexFormat.withUpperCase() present:"
+          $JAVA_HOME/bin/javap -p -classpath ../../libs/teavm-patches.jar java.util.HexFormat 2>&1 | grep -i "withUpperCase\|fromHexDigits" || echo "  NOT FOUND"
+          cd $GITHUB_WORKSPACE
+
+          echo "=== TeaVM JARs on classpath (for plugin API debugging) ==="
+          find ~/.gradle/caches -name "teavm-*.jar" 2>/dev/null | head -10
+          TEAVM_CORE_JAR=$(find ~/.gradle/caches -name "teavm-core-*.jar" 2>/dev/null | head -1)
+          if [ -n "$TEAVM_CORE_JAR" ]; then
+            echo "=== teavm-core contents (BooleanConstant/ElementModifier) ==="
+            $JAVA_HOME/bin/jar tf "$TEAVM_CORE_JAR" 2>&1 | grep -iE "BooleanConstant|ElementModifier|ConstInstruction" | head -20
+          fi
+
+          echo "=== Compiling TeaVM JavaScript ==="
+          echo "This may take 15-20 minutes for MC 26.2 (10,000+ classes)"
+          echo "Working directory: $(pwd)"
+          ls -la gradlew
+          # First, compile just the teavm Java sources so we can verify
+          # our stubs have the expected methods before running TeaVM.
+          ./gradlew --no-daemon --rerun-tasks --no-build-cache :sources:compileTeavmJava 2>&1 | tail -20
+          echo "=== Verifying LevelStorageSource$LevelStorageAccess methods ==="
+          find sources/build -name "LevelStorageSource\$LevelStorageAccess.class" -exec $JAVA_HOME/bin/javap -p {} \; 2>&1 | head -30
+          echo "=== Verifying LevelStorageSource methods ==="
+          find sources/build -name "LevelStorageSource.class" -not -name "*\\\$*" -exec $JAVA_HOME/bin/javap -p {} \; 2>&1 | head -30
+          # Use --rerun-tasks to force recompilation of Java sources.
+          # Without this, Gradle uses FROM-CACHE for compileTeavmJava and
+          # our Java source changes (e.g., Codec.java, MapCodec.java) are
+          # NOT recompiled — the old cached .class files are used instead.
+          ./gradlew --no-daemon --rerun-tasks --no-build-cache --stacktrace :sources:generateJavaScript 2>&1 | tee teavm.log
+
+          if grep -q "BUILD SUCCESSFUL" teavm.log; then
+            echo "TeaVM compilation succeeded!" | tee -a teavm.log
+            CLASSES_SIZE=$(stat -c%s sources/build/generated/teavm/js/classes.js 2>/dev/null || echo "0")
+            echo "classes.js size: $CLASSES_SIZE bytes" | tee -a teavm.log
+
+            # Patch classes.js with default method workaround
+            # (TeaVM 0.15 bug: interface default methods not in subclass vtable)
+            echo "Patching classes.js with default method workaround..." | tee -a teavm.log
+            python3 scripts/patch_default_methods.py \
+              sources/build/generated/teavm/js/classes.js \
+              sources/build/generated/teavm/js/classes.js 2>&1 | tee -a teavm.log
+            if [ $? -ne 0 ]; then
+              echo "ERROR: patch_default_methods.py failed!" | tee -a teavm.log
+              exit 1
+            fi
+            PATCHED_SIZE=$(stat -c%s sources/build/generated/teavm/js/classes.js)
+            echo "Patched classes.js size: $PATCHED_SIZE bytes" | tee -a teavm.log
+            echo "=== Verifying patches were applied ===" | tee -a teavm.log
+            if grep -q 'OxF=(b.uk?b.uk():null)' sources/build/generated/teavm/js/classes.js; then
+              echo "  OK: b.uk() null-safe patch applied" | tee -a teavm.log
+            else
+              echo "  WARNING: b.uk() null-safe patch NOT found!" | tee -a teavm.log
+            fi
+            if grep -q 'DDw.*this.uk' sources/build/generated/teavm/js/classes.js; then
+              echo "  OK: DDw uk method patch applied" | tee -a teavm.log
+            else
+              echo "  WARNING: DDw uk method patch NOT found!" | tee -a teavm.log
+            fi
+            if grep -q 'TfA.*__safe(null)' sources/build/generated/teavm/js/classes.js; then
+              echo "  OK: btB __safe patch applied" | tee -a teavm.log
+            else
+              echo "  WARNING: btB __safe patch NOT found!" | tee -a teavm.log
+            fi
+          else
+            echo "ERROR: TeaVM compilation failed - showing last 200 lines" | tee -a teavm.log
+            tail -200 teavm.log
+          fi
+
+      # ── Upload TeaVM log (always, even on failure) ──────────
+      - name: Upload TeaVM log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: teavm-log
+          path: teavm.log
+          retention-days: 30
+          if-no-files-found: warn
+
+      # ── Extract assets from vanilla JAR for EPK compilation ──
+      - name: Extract assets for EPK
+        run: |
+          echo "Extracting assets from vanilla 26.2 JAR..."
+          mkdir -p sources/setup/workspace_template/src/resources
+          cd sources/setup/workspace_template/src/resources
+          jar xf "$GITHUB_WORKSPACE/sources/libs/minecraft-26.2.jar" assets data
+          echo "Extracted $(find . -type f | wc -l) asset files"
+
+      # ── Build: Compile EPK assets ────────────────────────────
+      - name: Compile EPK assets
+        run: |
+          # Use Python EPK packer instead of CompileEPK.sh (which needs Gradle)
+          python3 scripts/make_epk.py sources/setup/workspace_template/src/resources public/assets.epk
+          echo "EPK size: $(stat -c%s public/assets.epk) bytes"
+
+      # ── Assemble public/ for deployment ──────────────────────
+      - name: Assemble public/ directory
+        run: |
+          echo "Assembling public/ directory..."
+          # Only copy classes.js from TeaVM output if the build SUCCEEDED
+          # and the output is non-trivial (>= 50KB). TeaVM sometimes writes
+          # a tiny stub file (just the source map comment) before failing,
+          # which would clobber the working committed classes.js.
+          CLASSES_JS=""
+          if grep -q "BUILD SUCCESSFUL" teavm.log 2>/dev/null; then
+            for path in sources/build/generated/teavm/js/classes.js sources/javascript/classes.js; do
+              if [ -f "$path" ]; then
+                SIZE=$(stat -c%s "$path" 2>/dev/null || echo 0)
+                if [ "$SIZE" -ge 50000 ]; then
+                  CLASSES_JS="$path"
+                  echo "Using TeaVM output: $path ($SIZE bytes)"
+                  break
+                else
+                  echo "WARNING: $path is only $SIZE bytes — too small, skipping"
+                fi
+              fi
+            done
+          else
+            echo "TeaVM build did not succeed — keeping committed classes.js"
+          fi
+          if [ -n "$CLASSES_JS" ]; then
+            cp "$CLASSES_JS" public/classes.js
+            echo "classes.js copied from $CLASSES_JS ($(stat -c%s public/classes.js) bytes)"
+          else
+            echo "Keeping committed public/classes.js ($(stat -c%s public/classes.js 2>/dev/null || echo 0) bytes)"
+          fi
+
+          for smap in sources/build/generated/teavm/js/classes.js.map sources/javascript/classes.js.map; do
+            if [ -f "$smap" ]; then
+              cp "$smap" public/classes.js.map
+              echo "Source map copied from $smap"
+              break
+            fi
+          done
+
+          if [ -f output/assets.epk ]; then
+            cp output/assets.epk public/assets.epk
+          elif [ ! -f public/assets.epk ]; then
+            echo "assets.epk not found - creating minimal placeholder"
+            printf 'EAGPK!!\x00\x00\x00\x00\x00\x00\x00\x00' > public/assets.epk
+          fi
+
+          if [ -d output/lang ]; then
+            mkdir -p public/lang
+            cp -r output/lang/* public/lang/
+          elif [ -d sources/resources/lang ]; then
+            mkdir -p public/lang
+            cp -r sources/resources/lang/* public/lang/ 2>/dev/null || true
+          fi
+
+          if [ -f sources/setup/workspace_template/javascript/favicon.png ]; then
+            cp sources/setup/workspace_template/javascript/favicon.png public/favicon.png 2>/dev/null || true
+          fi
+
+          echo "public/ contents:"
+          ls -la public/
+          echo "Total size: $(du -sh public/ | cut -f1)"
+
+      # ── Upload build artifacts ───────────────────────────────
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: eaglercraft-26.2-build
+          path: public/
+          retention-days: 30
+          if-no-files-found: warn
+
+      # ── Deploy to GitHub Pages ───────────────────────────────
+      - name: Deploy to GitHub Pages
+        uses: peaceiris/actions-gh-pages@v4
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          publish_dir: ./public
+          publish_branch: gh-pages
+          force_orphan: true
+          commit_message: "deploy: EaglerCraftX 26.2 build"
+      # This content will not be added - let me use Edit instead
