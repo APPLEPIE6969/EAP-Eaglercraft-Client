@@ -21,7 +21,7 @@ public class GlBackend implements GpuBackend {
 
     public void setWindowHints() {}
 
-    public GpuDevice createDevice(long windowHandle, ShaderSource shaderSource, GpuDebugOptions debugOptions, Runnable criticalShaderLoader) {
+    public GpuDevice createDevice(long windowHandle, ShaderSource shaderSource, GpuDebugOptions debugOptions, Runnable criticalShaderLoader) throws BackendCreationException {
         if (criticalShaderLoader != null) criticalShaderLoader.run();
         return new GpuDevice() {
             @Override

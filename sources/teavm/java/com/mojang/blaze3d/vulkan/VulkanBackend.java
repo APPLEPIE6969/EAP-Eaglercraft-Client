@@ -20,7 +20,7 @@ public class VulkanBackend implements GpuBackend {
 
     public void setWindowHints() {}
 
-    public GpuDevice createDevice(long windowHandle, ShaderSource shaderSource, GpuDebugOptions debugOptions, Runnable criticalShaderLoader) {
+    public GpuDevice createDevice(long windowHandle, ShaderSource shaderSource, GpuDebugOptions debugOptions, Runnable criticalShaderLoader) throws BackendCreationException {
         throw new BackendCreationException("Vulkan not supported in browser", BackendCreationException.Reason.VULKAN_LOADER_MISSING);
     }
 
