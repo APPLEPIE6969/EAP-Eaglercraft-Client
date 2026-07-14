@@ -489,17 +489,12 @@ public class MissingMethodTransformer implements ClassHolderTransformer {
         add("com.mojang.blaze3d.pipeline.BlendFunction", "dstAlpha",
             ValueType.object("com.mojang.blaze3d.platform.BlendFactor"), new ValueType[0], null, false);
 
-    }
-
-
         // ===== net.minecraft.client.PreferredGraphicsApi =====
         add("net.minecraft.client.PreferredGraphicsApi", "getSerializedName",
             ValueType.object("java.lang.String"), new ValueType[0], "opengl", false);
-        add("net.minecraft.client.PreferredGraphicsApi", "getBackendsToTry",
-            ValueType.array(ValueType.object("com.mojang.blaze3d.systems.GpuBackend")),
-            new ValueType[0], null, false);
 
     }
+
     private static void add(String className, String methodName, ValueType returnType, ValueType[] paramTypes, Object defaultValue, boolean isStatic) {
         METHODS.computeIfAbsent(className, k -> new ArrayList<>())
                .add(new MethodSpec(methodName, returnType, paramTypes, defaultValue, isStatic));
