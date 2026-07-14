@@ -531,8 +531,11 @@ public abstract class WebGL2RenderingContext implements JSObject {
         @JSMethod
         public abstract JSObject getParameter(int pname);
 
-        @JSMethod
-        public abstract String getString(int pname);
+        // WebGL2 doesn't have getString() - use getParameter() instead
+        default String getString(int pname) {
+            JSObject result = getParameter(pname);
+            return result != null ? result.toString() : "";
+        }
         public abstract void hint(int target, int mode);
 
         // ----- Blending -----
