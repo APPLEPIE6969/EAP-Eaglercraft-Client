@@ -532,7 +532,7 @@ public abstract class WebGL2RenderingContext implements JSObject {
         public abstract JSObject getParameter(int pname);
 
         // WebGL2 doesn't have getString() - use getParameter() instead
-        default String getString(int pname) {
+        public String getString(int pname) {
             JSObject result = getParameter(pname);
             return result != null ? result.toString() : "";
         }
